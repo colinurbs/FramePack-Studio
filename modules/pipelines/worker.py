@@ -1,5 +1,5 @@
 import os
-import json
+from pathlib import PurePath, Path
 import time
 import traceback
 import einops
@@ -7,21 +7,23 @@ import numpy as np
 import torch
 import datetime
 from PIL import Image
-from PIL.PngImagePlugin import PngInfo
 from diffusers_helper.models.mag_cache import MagCache
 from diffusers_helper.utils import save_bcthw_as_mp4, generate_timestamp, resize_and_center_crop
 from diffusers_helper.memory import cpu, gpu, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, unload_complete_models, load_model_as_complete
-from diffusers_helper.thread_utils import AsyncStream
 from diffusers_helper.gradio.progress_bar import make_progress_bar_html
 from diffusers_helper.hunyuan import vae_decode
-from modules.video_queue import JobStatus
 from modules.prompt_handler import parse_timestamped_prompt
-from modules.generators import create_model_generator
+from modules.generators import create_model_generator, BaseModelGenerator, VideoBaseModelGenerator, VideoModelGenerator, F1ModelGenerator
 from modules.pipelines.video_tools import combine_videos_sequentially_from_tensors
 from modules import DUMMY_LORA_NAME # Import the constant
 from . import create_pipeline
+from typing import Optional, Union
 
 import __main__ as studio_module # Get a reference to the __main__ module object
+# cSpell: disable hunyan, loras
+# Will hold the currently active model generator
+global current_generator
+current_generator: Optional[Union[BaseModelGenerator, VideoBaseModelGenerator]] = None
 
 @torch.no_grad()
 def get_cached_or_encode_prompt(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, target_device, prompt_embedding_cache):
@@ -79,8 +81,8 @@ def worker(
     has_input_image,
     lora_values=None, 
     job_stream=None,
-    output_dir=None,
-    metadata_dir=None,
+    output_dir: PurePath | str | None = None,
+    metadata_dir: PurePath | str | None = None,
     input_files_dir=None,  # Add input_files_dir parameter
     input_image_path=None,  # Add input_image_path parameter
     end_frame_image_path=None,  # Add end_frame_image_path parameter
@@ -112,10 +114,11 @@ def worker(
     # Import globals from the main module
     from __main__ import high_vram, args, text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae, image_encoder, feature_extractor, prompt_embedding_cache, settings, stream
     
+    global current_generator  # Use the global variable to access the current generator instance
     # Ensure any existing LoRAs are unloaded from the current generator
-    if studio_module.current_generator is not None:
-        print("Worker: Unloading LoRAs from studio_module.current_generator")
-        studio_module.current_generator.unload_loras()
+    if current_generator is not None:
+        print("Worker: Unloading LoRAs from current_generator")
+        current_generator.unload_loras()
         import gc
         gc.collect()
         if torch.cuda.is_available():
@@ -170,6 +173,8 @@ def worker(
         # Push job ID to main stream to ensure monitoring connection
         main_stream.output_queue.push(('job_id', job_id))
         main_stream.output_queue.push(('monitor_job', job_id))
+
+    job_params = {}
 
     try:
         # Create a settings dictionary for the pipeline
@@ -236,13 +241,13 @@ def worker(
         if not high_vram:
             # Unload everything *except* the potentially active transformer
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae)
-            if studio_module.current_generator is not None and studio_module.current_generator.transformer is not None:
-                offload_model_from_device_for_memory_preservation(studio_module.current_generator.transformer, target_device=gpu, preserved_memory_gb=8)
+            if current_generator is not None and current_generator.transformer is not None:
+                offload_model_from_device_for_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=8)
 
 
         # --- Model Loading / Switching ---
         print(f"Worker starting for model type: {model_type}")
-        print(f"Worker: Before model assignment, studio_module.current_generator is {type(studio_module.current_generator)}, id: {id(studio_module.current_generator)}")
+        print(f"Worker: Before model assignment, current_generator is {type(current_generator)}, id: {id(current_generator)}")
         
         # Create the appropriate model generator
         new_generator = create_model_generator(
@@ -262,17 +267,20 @@ def worker(
         
         # Update the global generator
         # This modifies the 'current_generator' attribute OF THE '__main__' MODULE OBJECT
-        studio_module.current_generator = new_generator
-        print(f"Worker: AFTER model assignment, studio_module.current_generator is {type(studio_module.current_generator)}, id: {id(studio_module.current_generator)}")
-        if studio_module.current_generator:
-             print(f"Worker: studio_module.current_generator.transformer is {type(studio_module.current_generator.transformer)}")        
+        current_generator = new_generator
+        print(f"Worker: AFTER model assignment, current_generator is {type(current_generator)}, id: {id(current_generator)}")
+        if current_generator:
+             print(f"Worker: current_generator.transformer is {type(current_generator.transformer)}")
+
+        assert current_generator is not None, "current_generator should not be None after model assignment"
+        assert current_generator.transformer is not None, "current_generator.transformer should not be None after model assignment"
              
         # Load the transformer model
-        studio_module.current_generator.load_model()
+        current_generator.load_model()
         
         # Ensure the model has no LoRAs loaded
         print(f"Ensuring {model_type} model has no LoRAs loaded")
-        studio_module.current_generator.unload_loras()
+        current_generator.unload_loras()
 
         # Preprocess inputs
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Preprocessing inputs...'))))
@@ -350,7 +358,7 @@ def worker(
             stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Video processing ...'))))
             
             # Encode the video using the VideoModelGenerator
-            start_latent, input_image_np, video_latents, fps, height, width, input_video_pixels, end_of_input_video_image_np, input_frames_resized_np = studio_module.current_generator.video_encode(
+            start_latent, input_image_np, video_latents, fps, height, width, input_video_pixels, end_of_input_video_image_np, input_frames_resized_np = current_generator.video_encode(
                 video_path=job_params['input_image'],  # For Video model, input_image contains the video path
                 resolution=job_params['resolutionW'],
                 no_resize=False,
@@ -390,8 +398,8 @@ def worker(
             video_latents = video_latents.cpu()
             
             # Store the full video latents in the generator instance for preparing clean latents
-            if hasattr(studio_module.current_generator, 'set_full_video_latents'):
-                studio_module.current_generator.set_full_video_latents(video_latents.clone())
+            if isinstance(current_generator, VideoModelGenerator):
+                current_generator.set_full_video_latents(video_latents.clone())
                 print(f"Stored full input video latents in VideoModelGenerator. Shape: {video_latents.shape}")
             
             # For Video model, history_latents is initialized with the video_latents
@@ -457,7 +465,7 @@ def worker(
                 # Use the main job's target width/height (bucket dimensions) for the end frame
                 end_frame_np = job_params['end_frame_image']
                 
-                if settings.get("save_metadata"):
+                if metadata_dir and settings.get("save_metadata") and Path(metadata_dir).is_dir():
                     Image.fromarray(end_frame_np).save(os.path.join(metadata_dir, f'{job_id}_end_frame_processed.png'))
                 
                 end_frame_pt = torch.from_numpy(end_frame_np).float() / 127.5 - 1
@@ -481,7 +489,7 @@ def worker(
                         load_model_as_complete(image_encoder, target_device=gpu)
                     from diffusers_helper.clip_vision import hf_clip_vision_encode
                     end_clip_embedding = hf_clip_vision_encode(end_frame_np, feature_extractor, image_encoder).last_hidden_state
-                    end_clip_embedding = end_clip_embedding.to(studio_module.current_generator.transformer.dtype)
+                    end_clip_embedding = end_clip_embedding.to(current_generator.transformer.dtype)
                     # Need that dtype conversion for end_clip_embedding? I don't think so, but it was in the original PR.
         
         if not high_vram: # Offload VAE and image_encoder if they were loaded
@@ -491,13 +499,13 @@ def worker(
         # Dtype
         for prompt_key in encoded_prompts:
             llama_vec, llama_attention_mask, clip_l_pooler = encoded_prompts[prompt_key]
-            llama_vec = llama_vec.to(studio_module.current_generator.transformer.dtype)
-            clip_l_pooler = clip_l_pooler.to(studio_module.current_generator.transformer.dtype)
+            llama_vec = llama_vec.to(current_generator.transformer.dtype)
+            clip_l_pooler = clip_l_pooler.to(current_generator.transformer.dtype)
             encoded_prompts[prompt_key] = (llama_vec, llama_attention_mask, clip_l_pooler)
 
-        llama_vec_n = llama_vec_n.to(studio_module.current_generator.transformer.dtype)
-        clip_l_pooler_n = clip_l_pooler_n.to(studio_module.current_generator.transformer.dtype)
-        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(studio_module.current_generator.transformer.dtype)
+        llama_vec_n = llama_vec_n.to(current_generator.transformer.dtype)
+        clip_l_pooler_n = clip_l_pooler_n.to(current_generator.transformer.dtype)
+        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(current_generator.transformer.dtype)
 
         # Sampling
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
@@ -509,12 +517,12 @@ def worker(
         total_generated_latent_frames = 0  # Default initialization for all model types
 
         # Initialize history latents based on model type
-        if model_type != "Video" and model_type != "Video F1":  # Skip for Video models as we already initialized it
-            history_latents = studio_module.current_generator.prepare_history_latents(height, width)
+        if isinstance(current_generator, F1ModelGenerator) and model_type != "Video" and model_type != "Video F1":  # Skip for Video models as we already initialized it
+            history_latents = current_generator.prepare_history_latents(height, width)
             
             # For F1 model, initialize with start latent
-            if model_type == "F1":
-                history_latents = studio_module.current_generator.initialize_with_start_latent(history_latents, start_latent)
+            if model_type == "F1" and isinstance(current_generator, F1ModelGenerator):
+                history_latents = current_generator.initialize_with_start_latent(history_latents, start_latent)
                 total_generated_latent_frames = 1  # Start with 1 for F1 model since it includes the first frame
             elif model_type == "Original" or model_type == "Original with Endframe":
                 total_generated_latent_frames = 0
@@ -522,7 +530,8 @@ def worker(
         history_pixels = None
         
         # Get latent paddings from the generator
-        latent_paddings = studio_module.current_generator.get_latent_paddings(total_latent_sections)
+        if isinstance(current_generator, VideoModelGenerator):
+            latent_paddings = current_generator.get_latent_paddings(total_latent_sections)
 
         # PROMPT BLENDING: Track section index
         section_idx = 0
@@ -530,11 +539,12 @@ def worker(
         # Load LoRAs if selected
         if selected_loras:
             lora_folder_from_settings = settings.get("lora_dir")
-            studio_module.current_generator.load_loras(selected_loras, lora_folder_from_settings, lora_loaded_names, lora_values)
+            current_generator.load_loras(selected_loras, lora_folder_from_settings, lora_loaded_names, lora_values)
 
             # --- Callback for progress ---
         def callback(d):
             nonlocal last_step_time, step_durations
+            global current_generator
             
             # Check for cancellation signal
             if stream_to_use.input_queue.top() == 'end':
@@ -597,7 +607,7 @@ def worker(
             if original_pos < 0: original_pos = 0
 
             hint = segment_hint  # deprecated variable kept to minimise other code changes
-            desc = studio_module.current_generator.format_position_description(
+            desc = current_generator.format_position_description(
                 total_generated_latent_frames, 
                 current_pos, 
                 original_pos, 
@@ -757,7 +767,7 @@ def worker(
                 
                 # Ensure history_latents is on the correct device (usually CPU for this kind of modification if it's init'd there)
                 # and that the assigned tensor matches its dtype.
-                # The `studio_module.current_generator.prepare_history_latents` initializes it on CPU with float32.
+                # The `current_generator.prepare_history_latents` initializes it on CPU with float32.
                 if history_latents.shape[2] >= 1: # Check if the 'Depth_slots' dimension is sufficient
                     if model_type == "Original with Endframe":
                         # For Original model, apply to the beginning (position 0)
@@ -781,18 +791,18 @@ def worker(
                 # Get num_cleaned_frames from job_params if available, otherwise use default value of 5
                 num_cleaned_frames = job_params.get('num_cleaned_frames', 5)
                 clean_latent_indices, latent_indices, clean_latent_2x_indices, clean_latent_4x_indices, clean_latents, clean_latents_2x, clean_latents_4x = \
-                studio_module.current_generator.video_prepare_clean_latents_and_indices(end_frame_output_dimensions_latent, end_frame_strength, end_clip_embedding, end_of_input_video_embedding, latent_paddings, latent_padding, latent_padding_size, latent_window_size, video_latents, history_latents, num_cleaned_frames)
+                current_generator.video_prepare_clean_latents_and_indices(end_frame_output_dimensions_latent, end_frame_strength, end_clip_embedding, end_of_input_video_embedding, latent_paddings, latent_padding, latent_padding_size, latent_window_size, video_latents, history_latents, num_cleaned_frames)
             elif model_type == "Video F1":
                 # Get num_cleaned_frames from job_params if available, otherwise use default value of 5
                 num_cleaned_frames = job_params.get('num_cleaned_frames', 5)
                 clean_latent_indices, latent_indices, clean_latent_2x_indices, clean_latent_4x_indices, clean_latents, clean_latents_2x, clean_latents_4x = \
-                studio_module.current_generator.video_f1_prepare_clean_latents_and_indices(latent_window_size, video_latents, history_latents, num_cleaned_frames)
+                current_generator.video_f1_prepare_clean_latents_and_indices(latent_window_size, video_latents, history_latents, num_cleaned_frames)
             else:
                 # Prepare indices using the generator
-                clean_latent_indices, latent_indices, clean_latent_2x_indices, clean_latent_4x_indices = studio_module.current_generator.prepare_indices(latent_padding_size, latent_window_size)
+                clean_latent_indices, latent_indices, clean_latent_2x_indices, clean_latent_4x_indices = current_generator.prepare_indices(latent_padding_size, latent_window_size)
 
                 # Prepare clean latents using the generator
-                clean_latents, clean_latents_2x, clean_latents_4x = studio_module.current_generator.prepare_clean_latents(start_latent, history_latents)
+                clean_latents, clean_latents_2x, clean_latents_4x = current_generator.prepare_clean_latents(start_latent, history_latents)
             
             # Print debug info
             print(f"{model_type} model section {section_idx+1}/{total_latent_sections}, latent_padding={latent_padding}")
@@ -800,14 +810,13 @@ def worker(
             if not high_vram:
                 # Unload VAE etc. before loading transformer
                 unload_complete_models(vae, text_encoder, text_encoder_2, image_encoder)
-                move_model_to_device_with_memory_preservation(studio_module.current_generator.transformer, target_device=gpu, preserved_memory_gb=settings.get("gpu_memory_preservation"))
+                move_model_to_device_with_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=settings.get("gpu_memory_preservation"))
                 if selected_loras:
-                    studio_module.current_generator.move_lora_adapters_to_device(gpu)
-
+                    current_generator.move_lora_adapters_to_device(gpu)
 
             from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
             generated_latents = sample_hunyuan(
-                transformer=studio_module.current_generator.transformer,
+                transformer=current_generator.transformer,
                 width=width,
                 height=height,
                 frames=num_frames,
@@ -842,34 +851,35 @@ def worker(
 
             total_generated_latent_frames += int(generated_latents.shape[2])
             # Update history latents using the generator
-            history_latents = studio_module.current_generator.update_history_latents(history_latents, generated_latents)
+            history_latents = current_generator.update_history_latents(history_latents, generated_latents)
 
             if not high_vram:
                 if selected_loras:
-                    studio_module.current_generator.move_lora_adapters_to_device(cpu)
-                offload_model_from_device_for_memory_preservation(studio_module.current_generator.transformer, target_device=gpu, preserved_memory_gb=8)
+                    current_generator.move_lora_adapters_to_device(cpu)
+                offload_model_from_device_for_memory_preservation(current_generator.transformer, target_device=gpu, preserved_memory_gb=8)
                 load_model_as_complete(vae, target_device=gpu)
 
             # Get real history latents using the generator
-            real_history_latents = studio_module.current_generator.get_real_history_latents(history_latents, total_generated_latent_frames)
+            real_history_latents = current_generator.get_real_history_latents(history_latents, total_generated_latent_frames)
 
             if history_pixels is None:
                 history_pixels = vae_decode(real_history_latents, vae).cpu()
             else:
-                section_latent_frames = studio_module.current_generator.get_section_latent_frames(latent_window_size, is_last_section)
+                section_latent_frames = current_generator.get_section_latent_frames(latent_window_size, is_last_section)
                 overlapped_frames = latent_window_size * 4 - 3
 
                 # Get current pixels using the generator
-                current_pixels = studio_module.current_generator.get_current_pixels(real_history_latents, section_latent_frames, vae)
+                current_pixels = current_generator.get_current_pixels(real_history_latents, section_latent_frames, vae)
                 
                 # Update history pixels using the generator
-                history_pixels = studio_module.current_generator.update_history_pixels(history_pixels, current_pixels, overlapped_frames)
+                history_pixels = current_generator.update_history_pixels(history_pixels, current_pixels, overlapped_frames)
                 
                 print(f"{model_type} model section {section_idx+1}/{total_latent_sections}, history_pixels shape: {history_pixels.shape}")
 
             if not high_vram:
                 unload_complete_models()
 
+            output_dir = output_dir if output_dir else settings.get("output_dir", "output")
             output_filename = os.path.join(output_dir, f'{job_id}_{total_generated_latent_frames}.mp4')
             save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=settings.get("mp4_crf"))
             print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
@@ -901,7 +911,7 @@ def worker(
         # Unload all LoRAs after generation completed
         if selected_loras:
             print("Unloading all LoRAs after generation completed")
-            studio_module.current_generator.unload_loras()
+            current_generator.unload_loras()
             import gc
             gc.collect()
             if torch.cuda.is_available():
@@ -910,9 +920,9 @@ def worker(
     except Exception as e:
         traceback.print_exc()
         # Unload all LoRAs after error
-        if studio_module.current_generator is not None and selected_loras:
+        if current_generator is not None and selected_loras:
             print("Unloading all LoRAs after error")
-            studio_module.current_generator.unload_loras()
+            current_generator.unload_loras()
             import gc
             gc.collect()
             if torch.cuda.is_available():
@@ -923,7 +933,7 @@ def worker(
             # Ensure all models including the potentially active transformer are unloaded on error
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, 
-                studio_module.current_generator.transformer if studio_module.current_generator else None
+                current_generator.transformer if current_generator else None
             )
     finally:
         # This finally block is associated with the main try block (starts around line 154)
@@ -984,9 +994,9 @@ def worker(
                         combined_output_filename = os.path.join(output_dir, f'{job_id}_combined_v1.mp4')
                         combined_result = None
                         try:
-                            if hasattr(studio_module.current_generator, 'combine_videos'):
+                            if hasattr(current_generator, 'combine_videos'):
                                 print(f"Using VideoModelGenerator.combine_videos to create side-by-side comparison")
-                                combined_result = studio_module.current_generator.combine_videos(
+                                combined_result = current_generator.combine_videos(
                                     source_video_path=input_video_path,
                                     generated_video_path=final_video_path_for_combine, # Use the correct variable
                                     output_path=combined_output_filename
@@ -1054,7 +1064,7 @@ def worker(
                 # input_frames_resized_np = job_params.get('input_frames_resized_np')
 
                 # RT_BORG: I cringe calliing methods on BaseModelGenerator that only exist on VideoBaseGenerator, until we refactor
-                input_frames_resized_np, fps, target_height, target_width = studio_module.current_generator.extract_video_frames(
+                input_frames_resized_np, fps, target_height, target_width = current_generator.extract_video_frames(
                     is_for_encode=False,
                     video_path=job_params['input_image'],
                     resolution=job_params['resolutionW'],
@@ -1085,11 +1095,11 @@ def worker(
                 traceback.print_exc()
     
     # Final verification of LoRA state
-    if studio_module.current_generator and studio_module.current_generator.transformer:
+    if current_generator and current_generator.transformer:
         # Verify LoRA state
         has_loras = False
-        if hasattr(studio_module.current_generator.transformer, 'peft_config'):
-            adapter_names = list(studio_module.current_generator.transformer.peft_config.keys()) if studio_module.current_generator.transformer.peft_config else []
+        if hasattr(current_generator.transformer, 'peft_config'):
+            adapter_names = list(current_generator.transformer.peft_config.keys()) if current_generator.transformer.peft_config else []
             if adapter_names:
                 has_loras = True
                 print(f"Transformer has LoRAs: {', '.join(adapter_names)}")
@@ -1099,7 +1109,7 @@ def worker(
             print(f"Transformer has no peft_config attribute")
             
         # Check for any LoRA modules
-        for name, module in studio_module.current_generator.transformer.named_modules():
+        for name, module in current_generator.transformer.named_modules():
             if hasattr(module, 'lora_A') and module.lora_A:
                 has_loras = True
             if hasattr(module, 'lora_B') and module.lora_B:
