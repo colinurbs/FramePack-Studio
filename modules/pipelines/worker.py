@@ -95,6 +95,9 @@ def worker(
     """
     Worker function for video generation.
     """
+
+    random_generator = torch.Generator("cpu").manual_seed(seed)
+
     # Filter out the dummy LoRA from selected_loras at the very beginning of the worker
     actual_selected_loras_for_worker = []
     if isinstance(selected_loras, list):
@@ -418,10 +421,9 @@ def worker(
 
                 # Create a random latent to serve as the initial VAE context anchor.
                 # This provides a random starting point without visual bias.
-                noise_rnd = torch.Generator("cpu").manual_seed(seed)
                 start_latent = torch.randn(
                     (1, 16, 1, height // 8, width // 8),
-                    generator=noise_rnd, device=noise_rnd.device
+                    generator=random_generator, device=random_generator.device
                 ).to(device=gpu, dtype=torch.float32)
 
                 # Create a neutral black image to generate a valid "null" CLIP Vision embedding.
@@ -533,7 +535,6 @@ def worker(
         # Sampling
         stream_to_use.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
 
-        rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
 
         # Initialize total_generated_latent_frames for Video model
@@ -847,7 +848,7 @@ def worker(
                 distilled_guidance_scale=gs,
                 guidance_rescale=rs,
                 num_inference_steps=steps,
-                generator=rnd,
+                generator=random_generator,
                 prompt_embeds=llama_vec,
                 prompt_embeds_mask=llama_attention_mask,
                 prompt_poolers=clip_l_pooler,
