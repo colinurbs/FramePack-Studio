@@ -32,31 +32,59 @@ if torch.backends.cuda.cudnn_sdp_enabled():
 
 print("Currently enabled native sdp backends:", enabled_backends)
 
+xformers_attn_func = None
+flash_attn_varlen_func = None
+flash_attn_func = None
+sageattn_varlen = None
+sageattn = None
+
 try:
     # raise NotImplementedError
     from xformers.ops import memory_efficient_attention as xformers_attn_func
-    print('Xformers is installed!')
 except:
-    print('Xformers is not installed!')
-    xformers_attn_func = None
+    pass
 
 try:
     # raise NotImplementedError
     from flash_attn import flash_attn_varlen_func, flash_attn_func
-    print('Flash Attn is installed!')
 except:
-    print('Flash Attn is not installed!')
-    flash_attn_varlen_func = None
-    flash_attn_func = None
+    pass
 
 try:
     # raise NotImplementedError
     from sageattention import sageattn_varlen, sageattn
-    print('Sage Attn is installed!')
 except:
-    print('Sage Attn is not installed!')
-    sageattn_varlen = None
-    sageattn = None
+    pass
+
+# --- Attention Summary ---
+print("\n--- Attention Configuration ---")
+has_sage = sageattn is not None and sageattn_varlen is not None
+has_flash = flash_attn_func is not None and flash_attn_varlen_func is not None
+has_xformers = xformers_attn_func is not None
+
+if has_sage:
+    print("✅  Using SAGE Attention (highest performance).")
+    ignored = []
+    if has_flash:
+        ignored.append("Flash Attention")
+    if has_xformers:
+        ignored.append("xFormers")
+    if ignored:
+        print(f"   - Ignoring other installed attention libraries: {', '.join(ignored)}")
+elif has_flash:
+    print("✅  Using Flash Attention (high performance).")
+    if has_xformers:
+        print("   - Consider installing SAGE Attention for highest performance.")
+        print("   - Ignoring other installed attention library: xFormers")
+elif has_xformers:
+    print("✅  Using xFormers.")
+    print("   - Consider installing SAGE Attention for highest performance.")
+    print("   - or Consider installing Flash Attention for high performance.")
+else:
+    print("⚠️  No attention library found. Using native PyTorch Scaled Dot Product Attention.")
+    print("   - For better performance, consider installing one of:")
+    print("     SAGE Attention (highest performance), Flash Attention (high performance), or xFormers.")
+print("-------------------------------\n")
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
